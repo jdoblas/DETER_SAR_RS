@@ -1,0 +1,867 @@
+---
+title: "Stabilization of Sentinel-1 series for Deforestation detection"
+output:
+  html_document:
+    keep_md: yes
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    code_folding: hide
+    df_print: paged
+  pdf_document:
+    toc: yes
+---
+```{r settings,include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, include=TRUE,warning=FALSE,message=FALSE)
+```
+# Results 
+
+```{r load_all_data, message=FALSE, warning=FALSE, include=FALSE}
+library (tidyverse)
+library(knitr,quietly=T)
+library(kableExtra,quietly=T)
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+# Function to convert python milliseconds to R dates
+convert_millis <- function(dmillis) as.Date.numeric(as.double(dmillis)/(24*60*60*1000),origin="1970-01-01")
+# Data loading
+input_folder <- "../../data/processed"
+input_file_DF <- paste(input_folder,"processed_TS_deforested.csv",sep="/")
+input_file_F <- paste(input_folder,"processed_TS_forest.csv",sep="/")
+data_DF <- read_csv(input_file_DF)
+data_F <- read_csv(input_file_F)
+# Data tidying
+data_tidy_DF_orig <- data_DF%>%
+  mutate_all(~na_if(.,-999))%>%
+  mutate(before_dt=convert_millis(before_dt))%>%
+  mutate(after_dt=convert_millis(after_dt))%>%
+  mutate(detection_dt=convert_millis(detection_dt))%>%
+  mutate(stab_period=if_else(stab_period==1,"1 yr","2 yr"))
+data_tidy_F_orig <- data_F%>%
+  mutate_all(~na_if(.,-999))%>%
+  mutate(after_dt=convert_millis(random_dt))%>% # Random dates for forest series
+  mutate(before_dt=convert_millis(random_dt))%>%
+  mutate(detection_dt=convert_millis(random_dt))%>%
+  mutate(stab_period=if_else(stab_period==1,"1 yr","2 yr"))
+# We filter out observations with less than 20 observations and with negative or zero values
+data_tidy_DF <- data_tidy_DF_orig%>%filter(orig>0,origf>0,harmon>0,harmonf>0,spatial>0,spatialf>0)
+data_tidy_F <- data_tidy_F_orig%>%filter(orig>0,origf>0,harmon>0,harmonf>0,spatial>0,spatialf>0)
+data_tidy_DF <- data_tidy_DF%>%group_by(id,stab_period,stab_pol)%>%summarize(npt=n())%>%left_join(data_tidy_DF)%>%filter(npt>=20)
+data_tidy_F <- data_tidy_F%>%group_by(id,stab_period,stab_pol)%>%summarize(npt=n())%>%left_join(data_tidy_F)%>%filter(npt>=20)
+# Data pivoting
+treatments <- c("orig","origf","harmon","harmonf","spatial","spatialf")
+filt_treat <- c("origf","harmonf","spatialf")
+nofilt_treat <- c("orig","harmon","spatial")
+data_long_F <- data_tidy_F%>%pivot_longer(all_of(treatments), names_to="treat",values_to="gamma")
+data_long_DF <- data_tidy_DF%>%pivot_longer(all_of(treatments), names_to="treat",values_to="gamma")
+# Filters out very high or low angle values
+data_long_F <- data_long_F%>%filter(LIA>30,LIA<45)
+data_long_DF <- data_long_DF%>%filter(LIA>30,LIA<45)
+# Joins classes
+data_F_DF <- data_long_DF%>%select(id,stab_period,stab_pol,treat,before_dt,after_dt,detection_dt,date,gamma)%>%
+  add_column("class"="DF")%>%
+  rbind(
+    data_long_F%>%select(id,stab_period,stab_pol,treat,before_dt,after_dt,detection_dt,date,gamma)%>%add_column("class"="F")
+  )%>%mutate(db=10*log10(gamma))%>%
+  mutate(id_n=ifelse(class=="F",id,id+3000))%>%
+  ungroup()
+
+pts_DF <- length(unique(data_tidy_DF$id))
+pts_F <- length(unique(data_tidy_F$id))
+pts_DF_t <- length(unique(data_long_DF$id))
+pts_F_t <- length(unique(data_long_F$id))
+
+```
+
+```{r thresholding_with_F_and_DF}
+#first, we split the deforestation samples. We fix the seed to maintain reproducibility
+train_split <- .5
+data_F_DF_only_DF <- data_F_DF%>%filter(class=="DF")
+l <- length(unique(data_F_DF_only_DF$id))
+set.seed(314);train_ids <- sample(unique(data_F_DF_only_DF$id),l*train_split)
+data_F_DF_DF_training <- data_F_DF_only_DF%>%filter(id%in%train_ids)
+data_F_DF_DF_validation <- data_F_DF_only_DF%>%anti_join(data_F_DF_DF_training,by="id")
+data_F_DF_only_F <- data_F_DF%>%filter(class=="F")
+l <- length(unique(data_F_DF_only_F$id))
+train_ids <- sample(unique(data_F_DF_only_F$id),l*train_split)
+data_F_DF_F_training <- data_F_DF_only_F%>%filter(id%in%train_ids)
+data_F_DF_F_validation <- data_F_DF_only_F%>%anti_join(data_F_DF_F_training,by="id")
+data_F_DF_training <- data_F_DF_F_training%>%rbind(data_F_DF_DF_training)
+data_F_DF_validation <- data_F_DF_F_validation%>%rbind(data_F_DF_DF_validation)
+```
+
+
+
+```{r,fig.cap="Figure XX: Example of extracted (A) Forest and (B) Deforested time series."}
+pti <- 1560
+ap <- ggplot(data_long_F%>%filter(id==pti,treat%in%c("orig","origf","harmonf","spatialf"),stab_pol=="VHg0",stab_period=="2 yr"),aes(x=date,y=10*log10(gamma),group=treat))+
+  geom_line(aes(size=treat,color=treat))+
+  geom_vline(aes(xintercept=before_dt),color="dark red",size=.7)+
+  geom_vline(aes(xintercept=after_dt),color="dark red",size=.7)+
+  geom_vline(aes(xintercept=detection_dt),color="red",size=.7)+
+  #scale_linetype_manual(values=c("longdash","solid","solid"))+
+  scale_size_manual(limits=c("orig","origf","harmonf","spatialf"),values=c(0.5,1.3,1.3,1.3))+
+  scale_color_manual(limits=c("orig","origf","harmonf","spatialf"),values=c("grey","red","green","blue"))+
+  scale_y_continuous(breaks=seq(-20,20,1))+
+  coord_cartesian(ylim=c(-20,-10))+
+  scale_x_date(position="top",breaks = function(x) seq.Date(from=as.Date('2016-01-01'), to=as.Date('2020-12-31'),by='3 months'),minor_breaks = "1 months",date_labels="%b'%y")+
+  theme_bw()+
+  ggtitle(paste(label="Temporal series gamma0 VH. Forest point:",pti))+
+  labs(caption="Data Sentinel-1 (ESA), via Google Earth Engine",x="",y="dB")+
+  theme(panel.grid.major.x=element_line(colour = "grey"))
+bp <- ggplot(data_long_DF%>%filter(id==pti,treat%in%c("orig","origf","harmonf","spatialf"),stab_pol=="VHg0",stab_period=="2 yr"),aes(x=date,y=10*log10(gamma),group=treat))+
+  geom_line(aes(size=treat,color=treat))+
+  geom_vline(aes(xintercept=before_dt),color="dark red",size=.7)+
+  geom_vline(aes(xintercept=after_dt),color="dark red",size=.7)+
+  geom_vline(aes(xintercept=detection_dt),color="red",size=.7)+
+  #scale_linetype_manual(values=c("longdash","solid","solid"))+
+  scale_size_manual(limits=c("orig","origf","harmonf","spatialf"),values=c(0.5,1.3,1.3,1.3))+
+  scale_color_manual(limits=c("orig","origf","harmonf","spatialf"),values=c("grey","red","green","blue"))+
+  scale_y_continuous(breaks=seq(-20,20,1))+
+  coord_cartesian(ylim=c(-20,-10))+
+  scale_x_date(position="top",breaks = function(x) seq.Date(from=as.Date('2016-01-01'), to=as.Date('2020-12-31'),by='3 months'),minor_breaks = "1 months",date_labels="%b'%y")+
+  theme_bw()+
+  ggtitle(paste(label="Temporal series gamma0 VH. Deforested point:",pti))+
+  labs(caption="Data Sentinel-1 (ESA), via Google Earth Engine",x="",y="dB")+
+  theme(panel.grid.major.x=element_line(colour = "grey"))
+
+#ggsave(paste("id_",pti,"_time_series_DF_VH.png",sep=""),device="png", width = 12, height = 6)
+ggpubr::ggarrange(ap, bp, labels = c("A", "B"), ncol = 1, nrow = 2)
+
+
+```
+
+
+
+```{r plot_all_series, eval=FALSE, include=FALSE}
+# This will plot ALL the VH 2-year time series. Be wise.
+pontos <- unique(data_F_DF$id_n)
+out_dir <-  "../../data/extracted/time_series_plots"
+for (pti in pontos){
+  ggplot(data_F_DF%>%filter(id_n==pti,treat%in%c("orig","origf","harmonf","spatialf"),stab_pol=="VHg0",stab_period=="2 yr"),aes(x=date,y=10*log10(gamma),group=treat))+
+    geom_line(aes(size=treat,color=treat))+
+    geom_vline(aes(xintercept=before_dt),color="dark red",size=.7)+
+    geom_vline(aes(xintercept=after_dt),color="dark red",size=.7)+
+    geom_vline(aes(xintercept=detection_dt),color="red",size=.7)+
+    #scale_linetype_manual(values=c("longdash","solid","solid"))+
+    scale_size_manual(limits=c("orig","origf","harmonf","spatialf"),values=c(0.5,1.3,1.3,1.3))+
+    scale_color_manual(limits=c("orig","origf","harmonf","spatialf"),values=c("grey","red","green","blue"))+
+    scale_y_continuous(breaks=seq(-20,20,1))+
+    coord_cartesian(ylim=c(-20,-11))+
+    scale_x_date(position="top",breaks = function(x) seq.Date(from=as.Date('2016-01-01'), to=as.Date('2020-12-31'),by='3 months'),minor_breaks = "1 months",date_labels="%b'%y")+
+    theme_bw()+
+    ggtitle(paste(label="Temporal series gamma0 VH point:",pti))+
+    labs(caption="Data Sentinel-1 (ESA), via Google Earth Engine",x="",y="dB")+
+    theme(panel.grid.major.x=element_line(colour = "grey"))
+  ggsave(paste0(out_dir,"/time_series_VH_2yr_pt",pti,".png"),device="png", width = 12, height = 6)
+}
+```
+
+
+The main characteristics of the times series are summarized here, for the forest and deforested locations:
+
+```{r forest_TS_table}
+
+data_long_F%>%group_by(stab_pol,stab_period,treat)%>%
+  summarize(n=n(),`mean # samples per point`=round(mean(npt),1),`Mean gamma`=mean(gamma),`Std. dev. gamma`=sd(gamma))%>%
+  arrange(stab_pol,stab_period,treat,)%>%
+  rename(Treatment=treat,`Period`=stab_period,Polarization=stab_pol,`# samples`=n)%>%
+  kable(caption="Table XX: Characteristics of the Forest Time Series.",digits=4)%>%kable_styling(full_width=F)
+```
+
+```{r deforest_TS_table}
+
+data_long_DF%>%group_by(stab_pol,stab_period,treat)%>%
+  summarize(n=n(),`mean # samples per point`=round(mean(npt),0),`Mean gamma`=mean(gamma),`Std. dev. gamma`=sd(gamma))%>%
+  arrange(stab_pol,stab_period,treat)%>%
+  rename(Treatment=treat,`Period`=stab_period,Polarization=stab_pol,`# samples`=n)%>%
+  kable(caption="Table XX: Characteristics of the Deforested Time Series.",digits=3)%>%kable_styling(full_width=F)
+```
+
+
+## Stabilization results
+
+
+```{r, compute stab stats}
+forests_TS_stats <- data_long_F%>%filter(date>=as.Date('2019-01-01'),date<as.Date('2020-01-01'))%>%
+  group_by(id,stab_period,stab_pol,treat)%>%
+  summarise(Mean=mean(gamma),SD=sd(gamma),CV=SD/Mean,IQR=IQR(gamma),MAD=mad(gamma))%>%
+  rename(Treatment=treat)
+forests_TS_stats$Treatment <- factor(forests_TS_stats$Treatment,levels= rev(treatments))
+```
+
+```{r,box plot stats stab filter,fig.cap="Fig XX: Coefficient of variation of the forest speckle-filtered time series, without stabilization (origf), with harmonic stabilization (harmonf) and with spatial stabilization (spatialf)"}
+library (RColorBrewer)
+library (ggpubr)
+#ggboxplot(forests_TS_stats%>%filter(Treatment%in%filt_treat),
+#          y="SD",x="Treatment", fill="Treatment",repel=T, ggtheme = theme_bw(),
+#          order=rev(filt_treat),orientation="horizontal",notch=T,palette="Set2")+
+#          facet_grid(stab_period~stab_pol,scales= "free_x")
+ggboxplot(forests_TS_stats%>%filter(Treatment%in%filt_treat),
+          y="CV",x="Treatment", fill="Treatment",repel=T, ggtheme = theme_bw(),
+          order=rev(filt_treat),orientation="horizontal",notch=T,palette="Set2")+
+          facet_grid(stab_period~stab_pol,scales= "free_x")
+#ggboxplot(forests_TS_stats%>%filter(Treatment%in%filt_treat),
+#          y="IQR",x="Treatment", fill="Treatment",repel=T, ggtheme = theme_bw(),
+#          order=rev(filt_treat),orientation="horizontal",notch=T,palette="Set2")+
+#          facet_grid(stab_period~stab_pol,scales= "free_x")
+#ggboxplot(forests_TS_stats%>%filter(Treatment%in%filt_treat),
+#          y="MAD",x="Treatment", fill="Treatment",repel=T, ggtheme = theme_bw(),
+#          order=rev(filt_treat),orientation="horizontal",notch=T,palette="Set2")+
+#          facet_grid(stab_period~stab_pol,scales= "free_x")
+```
+
+```{r}
+# Check normality
+#forests_TS_stats%>%group_by(Treatment,stab_pol,stab_period)%>%do(broom::tidy(shapiro.test(.$SD)))
+#forests_TS_stats%>%group_by(Treatment,stab_pol,stab_period)%>%do(broom::tidy(shapiro.test(.$CV)))
+#forests_TS_stats%>%group_by(Treatment,stab_pol,stab_period)%>%do(broom::tidy(shapiro.test(.$IQR)))
+#forests_TS_stats%>%group_by(Treatment,stab_pol,stab_period)%>%do(broom::tidy(shapiro.test(.$MAD)))
+# Check differences between groups
+forests_TS_stats_cv <- forests_TS_stats%>%pivot_wider(id_cols=c("id","stab_period","stab_pol"),names_from="Treatment",values_from="CV")
+
+forests_TS_stats_cv%>%group_by(stab_period,stab_pol)%>%
+  do(broom::tidy(t.test(.$origf,.$harmonf,alternative="greater")))%>%
+  select(stab_period,stab_pol,p.value)%>%
+  rename('origf-harmonf'=p.value)%>%
+  left_join(
+forests_TS_stats_cv%>%group_by(stab_period,stab_pol)%>%
+  do(broom::tidy(t.test(.$origf,.$spatialf,alternative="greater")))%>%
+  select(stab_period,stab_pol,p.value)%>%
+  rename('origf-spatialf'=p.value),by = c("stab_period", "stab_pol"))%>%
+  left_join(
+forests_TS_stats_cv%>%group_by(stab_period,stab_pol)%>%
+  do(broom::tidy(t.test(.$harmonf,.$spatialf,alternative="greater")))%>%
+  select(stab_period,stab_pol,p.value)%>%
+  rename('harmonf-spatialf'=p.value),by = c("stab_period", "stab_pol"))%>%
+kable(caption="Table XX. P-values of the T-tests comparing the coefficient of variation (CV) of the original series and the stabilized ones. All results show that the stabilized CV is significantly lower than the original CV.",digits=300,format.args=list(scientific=T))%>%kable_styling(full_width=F)
+```
+
+```{r table of changes}
+forest_TS_stats_summary <- forests_TS_stats%>%filter(Treatment%in%filt_treat)%>%group_by(stab_period,stab_pol,Treatment)%>%
+  summarise(mean_sd=mean(SD),mean_cv=mean(CV),mean_iqr=mean(IQR),mean_mad=mean(MAD))
+forests_TS_stats_cv%>%group_by(stab_period,stab_pol)%>%
+  summarise(origf_m=mean(origf),harmonf_m=mean(harmonf),spatialf_m=mean(spatialf))%>%
+  mutate('Change Origf-Harmonf (%)'=100*(harmonf_m-origf_m)/origf_m)%>%
+  mutate('Change Origf-Spatialf (%)'=100*(spatialf_m-origf_m)/origf_m)%>%
+  select(stab_period,stab_pol,starts_with("Change"))%>%
+  kable(caption="Table XX. Mean reduction of the variability of the time series, as measured by the CV.", digits=2)%>%kable_styling(full_width=F)
+#write_csv(forest_TS_stats_db_summary,paste0("extracted/",input_folder,"/processed/",input_folder,"_forest_summary.csv"))
+```
+
+
+```{r}
+#stats_vars <- c("mean","sd","cv","iqr","total_range","range_5_95")
+#forest_TS_stats_db_CI <- forests_TS_stats_db%>%pivot_longer(all_of(stats_vars),names_to="measure",values_to="value")%>%
+#  group_by(stab_period,stab_pol,treat,measure)%>%
+#  summarise(mean=mean(value),sd=sd(value),n=n())%>%
+#  mutate(CI_95=1.96*sd/sqrt(n))
+#write_csv(forest_TS_stats_db_CI,paste0("extracted/",input_folder,"/processed/",input_folder,"_forest_CI.csv"))
+```
+
+## Statistical characteristics of the stabilized forested and deforested time series
+
+Before enterprise a pixel-wise modelling we tested the forest time-series for normallity. The results of the normality Shapiro-Wilk testing show that ~80% of the filtered TS are normal (\alpha=5%) (see figure XX and table XX). The non-filtered series were successfully fitted using a Gamma distribution (see figure XX and table XX). 
+  
+```{r shapiro test}
+  data_long_F_shapiro <- data_long_F%>%filter(!is.na(gamma))%>%
+    group_by(id,stab_period,stab_pol,treat)%>%
+    do(broom::tidy(shapiro.test(.$gamma)))
+```
+
+```{r shapiro plot}
+  ggplot(data_long_F_shapiro,aes(x=p.value,fill=treat))+
+    geom_vline(xintercept=0.05)+
+    geom_boxplot()+
+    scale_fill_brewer(palette="Set2")+
+    facet_grid(stab_pol~stab_period)
+```
+
+```{r}
+data_long_F_shapiro%>%
+ mutate(normal=p.value>.05)%>%
+  group_by(stab_pol,stab_period,treat)%>%
+  summarise(n=n(),normal=sum(normal))%>%
+  mutate(perc_nomal=100*normal/n)%>%
+  kable(digits=2)%>%kable_styling(full_width=F)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(MASS)
+data_long_F_gamma <- data_long_F%>%filter(treat%in%nofilt_treat,!is.na(gamma))%>%
+  group_by(id,stab_period,stab_pol,treat)%>%
+  do(broom::tidy(fitdistr(.$gamma,"gamma")))
+detach("package:MASS")
+```
+```{r warning=FALSE}
+data_long_F_gamma_wider <- data_long_F_gamma%>%
+  pivot_wider(id_cols=c("id","stab_period", "stab_pol","treat"),names_from="term",values_from="estimate")
+data_long_F_w_gamma_params <- data_long_F%>%left_join(data_long_F_gamma_wider,by=c("id","stab_period", "stab_pol","treat"))
+data_long_F_w_gamma_params_ks <- data_long_F_w_gamma_params%>%group_by(id,stab_period, stab_pol,treat)%>%drop_na()%>%
+  do(broom::tidy(ks.test(.$gamma,"pgamma",first(.$shape),first(.$rate))))
+```
+```{r ks-plot,fig.cap="Fig XX. P-value of the Kolmogorov-Smirnoff test for the non-filtered TS."}
+ggplot(data_long_F_w_gamma_params_ks%>%filter(treat%in%nofilt_treat),aes(x=p.value,fill=treat))+
+  geom_vline(xintercept=0.05)+
+  geom_boxplot()+
+  scale_fill_brewer(palette="Set2")+
+  facet_grid(stab_pol~stab_period)
+```
+```{r ks-table}
+data_long_F_w_gamma_params_ks%>%filter(treat%in%nofilt_treat)%>%
+  mutate(fitgamma=p.value>.05)%>%
+  group_by(stab_period,stab_pol,treat)%>%
+  summarise(n=n(),fitgammat=sum(fitgamma))%>%
+  mutate(perc_gamma=100*fitgammat/n)%>%kable()%>%kable_styling()
+```
+
+## Detection of deforestation
+
+
+### Adaptative thresholding deforestation detection
+
+The first detection approach is based on the study of the range values of the forest time series. For every forest TS we computed the difference between its mean and its p1 value. The results showed that the forest backscatter values, once filtered, varies linearly through a narrow range of values. We also computed this relationship for the deforested values, selecting the samples registered *before* the deforestation event on a 50%-splitted training subset.
+
+```{r}
+# We compute medians and p1 and their difference
+data_F_rel_p1 <- data_F_DF_training%>%filter(class=="F"|(class=="DF"&date<before_dt))%>%
+  group_by(id,stab_pol,stab_period,treat)%>%
+  summarize(medg=mean(gamma),p1g=quantile(gamma,probs=c(.01)),p1medgr=medg/p1g,p1medg=medg-p1g,
+            meddb=mean(db),p1db=quantile(db,probs=c(.01)),p1meddb=meddb-p1db)
+#ggplot(data_F_rel_p1%>%filter(stab_pol=="VHg0"),aes(x=medg,y=p1medgr,color=treat))+
+#  geom_point(alpha=.2)+facet_grid(treat~stab_period)+
+#  geom_smooth(method="lm")+
+#  stat_poly_eq(aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+#               label.x.npc = "right", label.y.npc = 0.9,
+#               formula = formula, parse = TRUE, size = 3)+theme_bw()
+```
+
+```{r message=FALSE, warning=FALSE ,fig.width=8, fig.height=10,fig.cap="Figure XX. Relationship between the mean value of the forest VHg0 backscattering and the minimum (p1) value of the time series. As an alternative analysis, chart in (B) shows the p1 relationship between the median and the difference between the mean and the p1 value."}
+library(ggpmisc)
+formula <- y ~ x
+ap <- ggplot(data_F_rel_p1%>%filter(stab_pol=="VHg0"),aes(x=meddb,y=p1db,color=treat))+
+  geom_point(alpha=.2)+facet_grid(treat~stab_period)+
+  geom_smooth(method="lm")+
+  stat_poly_eq(aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+               label.x.npc = "right", label.y.npc = 0.1,
+               formula = formula, parse = TRUE, size = 2.5)+
+  theme_bw()+labs(x = "Mean of TS (dB)",y = "p1 value (dB)")
+bp <- ggplot(data_F_rel_p1%>%filter(stab_pol=="VHg0"),aes(x=meddb,y=p1meddb,color=treat))+
+  geom_point(alpha=.2)+facet_grid(treat~stab_period)+
+  geom_smooth(method="lm")+
+  stat_poly_eq(aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+               label.x.npc = "right", label.y.npc = 0.85,
+               formula = formula, parse = TRUE, size = 2.5)+
+  theme_bw()+labs(x = "Mean of TS (dB)",y = "mean-p1 value (dB)")
+ggpubr::ggarrange(ap, bp, labels = c("A", "B"), ncol = 1, nrow = 2,common.legend = T)
+```
+
+The results show that the distance between the forest mean and the minimum value of the forest TS is nearly constant (see tables XX and XX). As this, we may use this finding as a first approach to deforestation detection, using a range of values around the this distance to threshold and flag deforestation-suspected values of the time-series.
+
+```{r message=FALSE}
+forest_thresholds <- data_F_rel_p1%>%group_by(stab_pol,stab_period,treat)%>%summarize(meandb_th=mean(p1meddb),sddb_th=sd(p1meddb))%>%ungroup()
+```
+
+```{r}
+forest_thresholds%>%kable(caption="Table XX: Mean and standard deviation of the difference between the mean value and the p1 value of the forest time series, using invariant and deforestation-prone forest samples",digits=2)%>%kable_styling()
+```
+The following figure illustrates the thresholding values found for the original filtered VH series:
+
+```{r thresholding_profiles, fig.cap="Figure XX: example of the VHg0 time series thresholding. The horizontal lines shows the threshold level. The dashed lines show the standard deviation of the threshold along all the training dataset.", fig.width=8, fig.height=7}
+library(grid)
+data_DF_training_w_thresholds <- data_F_DF_training%>%filter(class=="DF")%>%left_join(forest_thresholds)
+pontos <- unique(data_DF_training_w_thresholds$id)
+random4 <- runif(4,1,length(pontos))
+ptis <- pontos[random4]
+ptis <- c(267,1235,2358,2363)
+plot_timeseries_w_threshold <- function(pti){
+  grob <- grobTree(textGrob(paste("DF point: ",pti), x=0.02,  y=0.03, hjust=0,gp=gpar(fontsize=8)))
+  data_plot <- data_DF_training_w_thresholds%>%filter(id==pti,stab_pol=="VHg0",treat=="origf",stab_period=="2 yr")
+  data_plot_beforedef <- data_plot%>%filter(date<before_dt)
+  meandb_th=first(data_plot$meandb_th);sddb_th=first(data_plot$sddb_th);before_dt=first(data_plot$before_dt);after_dt=first(data_plot$after_dt);detection_dt=first(data_plot$detection_dt)
+  th <- mean(data_plot_beforedef$db)-meandb_th
+  int_1 <- c(th-2*sddb_th,th+2*sddb_th)
+  p1 <- ggplot(data_plot,aes(x=date,y=db,group=treat))+
+    geom_line(aes(size=treat,color=treat))+
+    geom_vline(xintercept=before_dt,color="dark red",size=.7)+
+    geom_vline(xintercept=after_dt,color="dark red",size=.7)+
+    geom_vline(xintercept=detection_dt,color="red",size=1)+
+    geom_hline(yintercept=th,color="blue",size=.7)+
+    geom_hline(yintercept=int_1,color="blue",size=.7,linetype="dashed")+
+    scale_size_manual(values=c(1))+
+    scale_color_manual(values=c("black"))+
+    scale_y_continuous(breaks=seq(-20,20,1))+
+    coord_cartesian(ylim=c(-20,-8))+
+    scale_x_date(position="top",breaks = function(x) seq.Date(from=as.Date('2016-01-01'), to=as.Date('2020-08-01'),by='6 months'),minor_breaks = "1 months",date_labels="%b'%y")+
+    theme_bw()+
+    #ggtitle(paste(label="Temporal series gamma0 VH point:",pti))+
+    labs(x="",y=expression(gamma^0*" (dB)"))+
+    theme(panel.grid.major.x=element_line(colour = "grey"),legend.position = "none")+
+    annotation_custom(grob)
+  return (p1)
+}
+p1 <- plot_timeseries_w_threshold(ptis[1])
+p2 <- plot_timeseries_w_threshold(ptis[2])
+p3 <- plot_timeseries_w_threshold(ptis[3])
+p4 <- plot_timeseries_w_threshold(ptis[4])
+ggpubr::ggarrange(p1,p2,p3,p4,ncol=2,nrow=2)
+
+```
+For every treatment, the thresholding procedure was performed using a variety of dB values selected around the central value distance (mean-p1) value and varying it as -5 to +5 times the standard deviation of its distribution.
+
+```{r compute_means, message=FALSE, warning=FALSE}
+mean_F_validation <- data_F_DF_validation%>%filter(date<before_dt)%>%group_by(id, stab_period, stab_pol, treat,class)%>%summarize(mean_F_db=mean(db))
+data_F_DF_validation_w_mean_F <- data_F_DF_validation%>%ungroup()%>%left_join(mean_F_validation)
+
+data_F_DF_validation_w_mean_F_w_th <- data_F_DF_validation_w_mean_F%>%left_join(forest_thresholds)
+```
+
+```{r apply_linear_adaptative_thresholds_invariant_training}
+detection_period <- 120
+warnings_table <- tibble()
+for (threshold_factor in seq(-20,20,by=.02)){
+  temp_forest_table <- data_F_DF_validation_w_mean_F_w_th%>%filter(date>=after_dt,date<after_dt+detection_period)%>%
+    mutate(warning=db<(mean_F_db-meandb_th-(sddb_th*threshold_factor)))%>%
+    group_by(id, stab_period, stab_pol, treat,class)%>%
+    summarize(warnings=sum(warning),confirmed=warnings>0)%>% # Change that to 1 to work with confirmed warnings
+    group_by(stab_period, stab_pol, treat,class)%>%
+    summarise(n=n(),num_confirmed=sum(confirmed),detection_rate=100*num_confirmed/n())%>%
+    add_column(threshold=threshold_factor)
+  warnings_table <- rbind(temp_forest_table,warnings_table)
+}
+#data_F_DF_validation_th_w_mean_F_pols <- data_F_DF_validation_w_mean_F_w_th%>%select(-gamma)%>%
+#  pivot_wider(names_from="stab_pol",values_from=c("db","meandb_th_F","sddb_th_F","meandb_th_DF","sddb_th_DF","mean_F_db"),values_fn = mean)
+warnings_table_bivar <- tibble()
+# for (threshold_factor in seq(-5,8,by=.5)){
+#   temp_forest_table <- data_F_DF_validation_th_w_mean_F_pols%>%filter(date>=after_dt,date<after_dt+detection_period)%>%
+#     mutate(warning_VH=db_VHg0<(mean_F_db_VHg0-meandb_th_F_VHg0-(sddb_th_F_VHg0*threshold_factor)))%>%
+#     mutate(warning_VV=db_VVg0<(mean_F_db_VVg0-meandb_th_F_VVg0-(sddb_th_F_VVg0*threshold_factor)))%>%
+#     mutate(warning=warning_VH*warning_VV)%>%
+#     #mutate(warning=gamma<(mean_F_g-mean_F_g/(sdg_th*(sdg_th^threshold_factor))))%>%
+#     group_by(id, stab_period, treat,class)%>%
+#     summarize(warnings=sum(warning),confirmed=warnings>0)%>% # Change that to 1 to work with confirmed warnings
+#     group_by(stab_period, treat,class)%>%
+#     summarise(n=n(),num_confirmed=sum(confirmed,na.rm = T))%>%
+#     add_column(threshold=threshold_factor,stab_pol="VH_VV")
+#   warnings_table_bivar_F <- rbind(temp_forest_table,warnings_table_bivar_F)
+#}
+```
+
+
+The results show a good accuracy of the VH-based detections, reaching 95% in total accuracy. Meanwhile, the stabilization processes don't seem to significantly improve the detection results, whether using invariant or deforestation-prone forest training samples (figures XX to XX).
+
+```{r compute_accuracy_values_ALT}
+beta <- .5
+final_results_ALT <- warnings_table%>%rbind(warnings_table_bivar)%>%
+  select(-detection_rate)%>%
+  pivot_wider(names_from="class",values_from=c("n","num_confirmed"))%>%
+  mutate(TP=as.numeric(num_confirmed_DF),TN=as.numeric(n_F-num_confirmed_F),FP=as.numeric(num_confirmed_F),FN=as.numeric(n_DF-num_confirmed_DF),TS=n_F+n_DF)%>%
+  mutate(UA=TP/(FP+TP))%>%
+  mutate(PA=TP/(FN+TP))%>%
+  mutate(ACC=(TP+TN)/TS)%>%
+  mutate(TPR=TP/(TP+FN))%>%
+  mutate(PPV=TP/((TP+FP)))%>%
+  mutate(TNR=TN/(TN+FP))%>%
+  mutate(FPR=1-TNR,FNR=1-TPR)%>%
+  mutate(BACC=(1.3*TNR+.7*TPR)/2)%>%
+  mutate(F05= (1+beta^2)*PPV*TPR/(TPR+PPV*beta^2))%>%
+  mutate(MCC=(TP*TN-FP*FN)/(sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN))))%>%
+  mutate(FMI=sqrt((TP/(TP+FP))*(TP/(TP+FN))))
+
+```
+
+```{r fig.cap="Figure XX. User accuracy vs. Producer accuracy of the adaptative linear thresholding detection procedure. A: Using invariant forest as training samples. B: Using deforestation-prone samples as training samples."}
+ggplot(final_results_ALT%>%pivot_longer(c("UA","PA"),names_to="Accuracy",values_to="Percentage")%>%filter(treat%in%c("orig","origf","harmonf","spatialf")),aes(x=threshold,y=Percentage))+
+  geom_line(aes(color=treat,size=Accuracy))+
+  scale_size_manual(values=c(0.7,1.2))+
+  scale_linetype_manual(values=c(2,1))+
+  scale_color_manual(breaks=c("orig","origf","harmonf","spatialf"),labels=c("Original","Original Filtered","Harmonic","Spatial"),values=c("grey","orange","green","purple"))+
+  facet_grid(stab_pol~stab_period)+
+  coord_cartesian(xlim=c(-5,5))+
+  theme_bw()
+```
+
+```{r accuracy_plots_ALT,fig.cap="Figure XX. Global accuracy of the adaptative linear thresholding detection procedure. A: Using invariant forest as training samples. B: Using deforestation-prone samples as training samples."}
+# ACC
+ggplot(final_results_ALT%>%filter(treat%in%c("orig","origf","harmonf","spatialf")),aes(x=threshold,y=100*ACC))+
+  geom_line(aes(color=treat),size=1)+
+  scale_color_manual(name="Treatment",breaks=c("orig","origf","harmonf","spatialf"),labels=c("Original","Original Filtered","Harmonic","Spatial"),values=c("grey","orange","green","purple"))+
+  facet_grid(stab_pol~stab_period)+
+  coord_cartesian(xlim=c(-5,5))+
+  theme_bw()+labs(x="Threshold",y="Global accuracy (%)")
+
+``` 
+```{r ROC_plots_ALT,fig.width=8, fig.height=10,fig.cap="Figure XX. ROC curves associated to the adaptative linear thresholding detection procedure. A: Using invariant forest as training samples. B: Using deforestation-prone samples as training samples."}
+# ROC
+a1 <- ggplot(final_results_ALT%>%filter(treat%in%c("orig","origf","harmonf","spatialf")),aes(x=100*FPR,y=100*TPR))+
+  geom_line(aes(color=treat),size=1)+
+  scale_color_manual(name="Treatment",breaks=c("orig","origf","harmonf","spatialf"),labels=c("Original","Original Filtered","Harmonic","Spatial"),values=c("grey","orange","green","purple"))+
+  facet_grid(stab_pol~stab_period)+coord_cartesian(xlim=c(0,1),ylim=c(0.5,1))+
+  coord_cartesian(xlim=c(.1,100),ylim=c(30,100))+
+  theme_bw()+labs(x="False Positive Rate (%)",y="True Positive Rate (%)")
+
+a2 <- ggplot(final_results_ALT%>%filter(treat%in%c("orig","origf","harmonf","spatialf")),aes(x=100*FPR,y=100*TPR))+
+  geom_line(aes(color=treat),size=1)+
+  scale_color_manual(name="Treatment",breaks=c("orig","origf","harmonf","spatialf"),labels=c("Original","Original Filtered","Harmonic","Spatial"),values=c("grey","orange","green","purple"))+
+  facet_grid(stab_pol~stab_period)+coord_cartesian(xlim=c(0,1),ylim=c(0.5,1))+
+  coord_cartesian(xlim=c(.1,100),ylim=c(50,100))+
+  scale_x_log10()+
+  scale_y_log10()+
+  theme_bw()+labs(x="False Positive Rate (%)",y="True Positive Rate (%)")
+
+ggpubr::ggarrange(a1, a2,labels = c("A", "B"), ncol = 1, nrow = 2,common.legend=T)
+``` 
+
+```{r table_results_ALT}
+final_results_ALT%>%
+  mutate(Accuracy=ACC*100)%>%select(stab_period,stab_pol,treat,threshold,n_DF,n_F,num_confirmed_DF,num_confirmed_F, UA,PA,Accuracy)%>%
+  arrange(desc(Accuracy))%>%head(n=10L)%>%
+  kable(caption="Table XX. Final results of the ALT detection (only 10 best results showed).",digits=2)%>%kable_styling()
+```
+
+### Pixel-wise Maximum likelihood classification approach to deforestation detection
+
+Maximum-likelihood classification of the F/DF time series implies the determination of the density of the statistical distribution of the backscattering values for the F and DF classes. While determination of the parameters of the forest series is trivial, the deforestation samples are somewhat trickier to study and we don't know exactly the time of the deforestation. To separate the forest and non-forest samples of the DF TS we will use a finite mixture statistical modelling (REF Mclust), using a six-month sampling of the TS samples **after** the deforestation, i.e., the *after_dt* parameter. The figure XX show the distribution of the F/DF distribution parameters.
+
+
+Once assured the normality of the filtered time series we proceed to determination the relationship of the forest and deforested data points over the deforested time series. The forest statistical parameters (\mu,\sigma) were computed using the time series **before** the deforestation, i.e. the *before_dt* parameter. The deforested parameters were computed using a six-month sampling of the TS samples **after**, i.e., the *after_dt* parameter. The figure XX show the distribution of the F/DF distribution parameters.
+
+
+
+```{r pixel_clustering, message=FALSE, warning=FALSE}
+detection_period_days <- 6*30
+library(mclust)
+
+data_train_px_clust <- data_F_DF_training%>%filter(class=="DF",treat%in%filt_treat,date>=after_dt,date<=after_dt+detection_period_days)
+data_train_px_clust <- data_train_px_clust%>%group_by(id,stab_period,stab_pol)%>%summarize(npt=n())%>%left_join(data_train_px_clust)%>%filter(npt>=20)
+
+#data_long_filtered_EM5 <-  data_train_px_clust%>%group_by(id,stab_pol,stab_period,treat)%>%
+#  do(broom::tidy(Mclust(.$gamma,G=5,verbose=F,model="V")))
+#data_long_filtered_EM4 <-  data_train_px_clust%>%group_by(id,stab_pol,stab_period,treat)%>%
+#  do(broom::tidy(Mclust(.$gamma,G=4,verbose=F,model="V")))
+#data_long_filtered_EM3 <-  data_train_px_clust%>%group_by(id,stab_pol,stab_period,treat)%>%
+#  do(broom::tidy(Mclust(.$gamma,G=3,verbose=F,model="V")))
+data_long_filtered_EM2 <-  data_train_px_clust%>%group_by(id,stab_pol,stab_period,treat)%>%
+  do(broom::tidy(Mclust(.$gamma,G=2,verbose=F,model="V")))
+
+```
+
+```{r pixel_clustering_plots}
+#ggplot(data_long_filtered_EM5%>%filter(stab_pol=="VHg0"),aes(x=10*log10(mean),fill=as.factor(component)))+
+#  geom_density(alpha=.5)+
+#  facet_grid(treat~stab_period)
+#ggplot(data_long_filtered_EM4%>%filter(stab_pol=="VHg0"),aes(x=10*log10(mean),fill=as.factor(component)))+
+#  geom_density(alpha=.5)+
+#  facet_grid(treat~stab_period)
+#ggplot(data_long_filtered_EM3%>%filter(stab_pol=="VHg0"),aes(x=10*log10(mean),fill=as.factor(component)))+
+#  geom_density(alpha=.5)+
+#  facet_grid(treat~stab_period)
+ggplot(data_long_filtered_EM2%>%filter(stab_pol=="VHg0"),aes(x=10*log10(mean),fill=as.factor(component)))+
+  geom_density(alpha=.5)+labs(x=expression(paste(gamma[vh]^0," (dB)")))+
+  scale_fill_manual(name="Component",values=c("red","darkgreen"),labels=c("DF","F"))+
+  facet_grid(treat~stab_period)+
+  coord_cartesian(xlim=c(-22,-10))+
+  labs(y="Density")+
+  theme_bw()
+```
+
+The Jeffries–Matusita distance, as a measure of separability of the computed classes, show satisfactory values, being most of the series well above the value of 1, indicating a good class separability (figure XX)
+
+```{r distance_computation, fig.cap="Figure XX: Jeffreis-Matsushita distance of the F/DF classes as computed by the finite mixture algoritm."}
+jm_distance_1d <- function (mu1,mu2,sigma1,sigma2){
+  b_dist_1d <- .25*log(.25*((sigma1^2/sigma2^2) +( sigma2^2/sigma1^2) + 2)) + .25*(mu1-mu2)^2/(sigma1^2+sigma2^2)
+  sqrt(2*(1-exp(-b_dist_1d)))
+}     
+params_1d_2comp <- data_long_filtered_EM2%>%pivot_wider(names_from='component',values_from=c("size","proportion","variance","mean"))%>%
+  mutate(jm_dist=jm_distance_1d(mean_1,mean_2,sqrt(variance_1),sqrt(variance_2)))
+data_DF_training_w_params_2comp <- data_F_DF_training%>%filter(class=="DF",treat%in%filt_treat)%>%left_join(params_1d_2comp,by=c("id", "stab_period", "stab_pol", "treat"))
+
+ggplot(params_1d_2comp,aes(x=jm_dist,fill=stab_period))+
+  geom_density(alpha=.5)+facet_grid(treat~stab_pol)+labs(x="Jeffries–Matusita distance",y="Density",fill="Stab. Period")+
+  theme_bw()
+```
+
+The following figure illustrates the fitting of the F and DF components to DF extracted TS:
+
+```{r, fig.cap="Figure XX: example of the VHg0 time series clustering. The horizontal lines shows the mean and 1-sigma interval for the forest component (green) and for the deforested component (brown). Only original, non stabilized series showed.", fig.height=7}
+library(grid)
+pontos <- unique(data_DF_training_w_params_2comp$id)
+random4 <- runif(4,1,length(pontos))
+ptis <- pontos[random4]
+ptis <- c(267,1235,2358,2363)
+plot_timeseries_w_components <- function(pti){
+  grob <- grobTree(textGrob(paste("DF point: ",pti), x=0.02,  y=0.03, hjust=0,gp=gpar(fontsize=8)))
+  data_plot <- data_DF_training_w_params_2comp%>%filter(id==pti,stab_pol=="VHg0",treat=="origf",stab_period=="2 yr")
+  mean_1=first(data_plot$mean_1);mean_2=first(data_plot$mean_2);variance_1=first(data_plot$variance_1);variance_2=first(data_plot$variance_2);before_dt=first(data_plot$before_dt);after_dt=first(data_plot$after_dt);detection_dt=first(data_plot$detection_dt)
+  int_1 <- c(mean_1-sqrt(variance_1),mean_1+sqrt(variance_1))
+  int_2 <- c(mean_2-sqrt(variance_2),mean_2+sqrt(variance_2))
+  p1 <- ggplot(data_plot,aes(x=date,y=10*log10(gamma),group=treat))+
+    geom_line(aes(size=treat,color=treat))+
+    geom_vline(xintercept=before_dt,color="dark red",size=.7)+
+    geom_vline(xintercept=after_dt,color="dark red",size=.7)+
+    geom_vline(xintercept=detection_dt,color="red",size=1)+
+    geom_hline(yintercept=10*log10(mean_1),color="red",size=.7)+
+    geom_hline(yintercept=10*log10(mean_2),color="darkgreen",size=.7)+
+    geom_hline(yintercept=10*log10(int_1),color="red",size=.7,linetype="dashed")+
+    geom_hline(yintercept=10*log10(int_2),color="darkgreen",size=.7,linetype="dashed")+
+    scale_size_manual(values=c(1))+
+    scale_color_manual(values=c("black"))+
+    scale_y_continuous(breaks=seq(-20,20,1))+
+    coord_cartesian(ylim=c(-20,-8))+
+    scale_x_date(position="top",breaks = function(x) seq.Date(from=as.Date('2016-01-01'), to=as.Date('2020-08-01'),by='6 months'),minor_breaks = "1 months",date_labels="%b'%y")+
+    theme_bw()+
+    #ggtitle(paste(label="Temporal series gamma0 VH point:",pti))+
+    labs(x="",y=expression(paste(gamma[vh]^0," (dB)")))+
+    theme(panel.grid.major.x=element_line(colour = "grey"),legend.position = "none")+
+    annotation_custom(grob)
+  return (p1)
+}
+p1 <- plot_timeseries_w_components(ptis[1])
+p2 <- plot_timeseries_w_components(ptis[2])
+p3 <- plot_timeseries_w_components(ptis[3])
+p4 <- plot_timeseries_w_components(ptis[4])
+ggpubr::ggarrange(p1,p2,p3,p4,ncol=2,nrow=2)
+
+```
+
+
+```{r clustering_chart, fig.cap="Figure XX: Correlation between the forest and deforested means for VHg0 and VVg0 polarizations", message=FALSE, warning=FALSE,fig.width=8, fig.height=10}
+library(ggpmisc)
+formula <- 'y ~ x'
+p1 <- ggplot(data_DF_training_w_params_2comp%>%filter(stab_pol=="VHg0"),aes(x=mean_2,y=mean_1,color=treat))+
+        geom_point(alpha=.03)+
+        facet_grid(treat~stab_period)+
+        geom_smooth(method="lm")+
+        scale_color_brewer(palette ="Set2",name="Treatment")+
+        labs(x=expression("Forest "*gamma^0),y=expression("Deforestation "*gamma^0))+
+        stat_poly_eq(aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+               label.x.npc = "left", label.y.npc = 1,coef.digits=2, 
+               formula = formula, parse = TRUE, size = 3)+
+        theme_bw()
+p2 <- ggplot(data_DF_training_w_params_2comp%>%filter(stab_pol=="VVg0"),aes(x=mean_2,y=mean_1,color=treat))+
+        geom_point(alpha=.03)+
+        facet_grid(treat~stab_period)+
+        geom_smooth(method="lm")+
+        scale_color_brewer(palette="Set2",name="Treatment")+
+        labs(x=expression("Forest "*gamma^0),y=expression("Deforestation "*gamma^0))+
+        stat_poly_eq(aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+               label.x.npc = "left", label.y.npc = 1,coef.digits=2, 
+               formula = formula, parse = TRUE, size = 3)+
+        theme_bw()
+ggpubr::ggarrange(p1,p2, labels=c("A","B"),ncol=1)
+```
+```{r,caption="Table XX. Linear correlation between the forest and non-forest components"}
+library(broom)
+dist_params_lm_clust_2comp <- data_DF_training_w_params_2comp%>%group_by(stab_pol,stab_period,treat)%>%
+  do(glance(lm(mean_1 ~ mean_2, data = .)))
+dist_params_lm_clust_2comp%>%kable(caption="Results of the linear correlation between F and DF means of the training subset.")%>%kableExtra::kable_styling()
+```
+
+
+```{r} 
+library(broom)
+dist_params_lm_clust_2comp_var_var <- data_DF_training_w_params_2comp%>%group_by(stab_pol,stab_period,treat)%>%
+  do(glance(lm(variance_1 ~ variance_2, data = .)))
+dist_params_lm_clust_2comp_var_mean <- data_DF_training_w_params_2comp%>%group_by(stab_pol,stab_period,treat)%>%
+  do(glance(lm(variance_1 ~ mean_2, data = .)))
+dist_params_lm_clust_2comp_var_var%>%kable(caption="Results of the linear correlation between F and DF variances of the training subset.")%>%kableExtra::kable_styling()
+dist_params_lm_clust_2comp_var_mean%>%kable(caption="Results of the linear correlation between F means and the DF variances of the training subset.")%>%kableExtra::kable_styling()
+```
+
+
+```{r}
+# Detection. Simulation of a 4-month detection over the validation TS
+
+# Inference of the parameters of the distributions for every treatment
+dist_coeffs_lm_clust_2comp <- data_DF_training_w_params_2comp%>%group_by(stab_pol,stab_period,treat)%>%
+  do(tidy(lm(mean_1 ~ mean_2, data = .)))%>%
+  select(stab_pol,stab_period,treat,term,estimate)%>%
+  pivot_wider(names_from = "term",values_from="estimate")%>%rename(Intercept=`(Intercept)`)
+sd_DF <- data_DF_training_w_params_2comp%>%
+  mutate(sd_1=sqrt(variance_1))%>%
+  group_by(stab_pol,stab_period,treat)%>%
+  summarise(sd_DF=mean(sd_1,na.rm=T))
+data_F_DF_validation_w_coeffs <- data_F_DF_validation%>%filter(treat%in%filt_treat)%>%left_join(dist_coeffs_lm_clust_2comp)%>%left_join(sd_DF)
+F_DF_params <- data_F_DF_validation_w_coeffs%>%filter(date<before_dt)%>%
+  group_by(id,stab_pol,stab_period,treat,class)%>%
+  summarise(mean_F=mean(gamma),sd_F=sd(gamma),mean_2=mean(mean_2),intercept=mean(Intercept),sd_DF=mean(sd_DF))%>%
+  mutate(mean_DF=mean_F*mean_2+intercept)%>%select(-mean_2,-intercept)
+# detection
+detection_period <- 4*30
+data_F_DF_validation_w_F_DF_params <- data_F_DF_validation%>%filter(treat%in%filt_treat,date>=after_dt,date<=after_dt+detection_period)%>%left_join(F_DF_params)
+data_F_DF_validation_loglkDF <- data_F_DF_validation_w_F_DF_params%>%
+  mutate(dF=dnorm(gamma,mean_F,sd_F))%>%
+  mutate(dDF=dnorm(gamma,mean_DF,sd_DF))%>%
+  #mutate(dF=ifelse(gamma>mean_F,dnorm(mean_F,mean_F,sd_F),dF))%>%
+  #mutate(dDF=ifelse(gamma<mean_DF,dnorm(mean_DF,mean_DF,sd_DF),dDF))%>%
+  mutate(loglkDF=log(dDF/dF))
+```
+```{r lk_chart, fig.cap="Figure XX. Distribution of the values of the log-likelihood of the validation samples."}
+ggplot(data_F_DF_validation_loglkDF%>%filter(stab_pol=="VHg0",loglkDF>-7,loglkDF<7),aes(x=loglkDF))+geom_density(aes(fill=treat),alpha=.3)+facet_grid(class~stab_period)+labs(x="deforestation log-likelihood",y="Density",fill="Treatment")+theme_bw()
+
+```
+```{r apply_max_likelihood_classification}
+warnings_table_ML <- tibble()
+for (threshold in seq(-20,20,by=.02)){
+  temp_forest_table <- data_F_DF_validation_loglkDF%>%
+    mutate(warning=loglkDF>threshold)%>%
+    group_by(id, stab_period, stab_pol, treat,class)%>%
+    summarize(warnings=sum(warning),confirmed=warnings>0)%>% # Change that to 1 to work with confirmed warnings
+    group_by(stab_period, stab_pol, treat,class)%>%
+    summarise(n=n(),num_confirmed=sum(confirmed),detection_rate=100*num_confirmed/n())%>%
+    add_column(threshold=threshold)
+  warnings_table_ML <- rbind(temp_forest_table,warnings_table_ML)
+}
+data_F_DF_validation_loglkDF_pols <- data_F_DF_validation_loglkDF%>%
+  select(id, stab_period, stab_pol, treat,class,date,loglkDF)%>%
+  pivot_wider(names_from="stab_pol",values_from="loglkDF",values_fn = mean)
+warnings_table_ML_bivar <- tibble()
+# for (threshold in seq(-5,5,by=.2)){
+#   temp_forest_table <- data_F_DF_validation_loglkDF_pols%>%
+#     mutate(warning_VH=VHg0>threshold)%>%
+#     mutate(warning_VV=VVg0>threshold)%>%
+#     mutate(warning=warning_VH*warning_VV)%>%
+#     #mutate(warning=gamma<(median_F_g-median_F_g/(sdg_th*(sdg_th^threshold_factor))))%>%
+#     group_by(id, stab_period, treat,class)%>%
+#     summarize(warnings=sum(warning),confirmed=warnings>0)%>% # Change that to 1 to work with confirmed warnings
+#     group_by(stab_period, treat,class)%>%
+#     summarise(n=n(),num_confirmed=sum(confirmed,na.rm = T))%>%
+#     add_column(threshold=threshold,stab_pol="VH_VV")
+#   warnings_table_ML_bivar <- rbind(temp_forest_table,warnings_table_ML_bivar)
+#}
+```
+
+
+
+```{r compute_accuracy_values_ML}
+beta <- .5
+final_results_ML <- warnings_table_ML%>%rbind(warnings_table_ML_bivar)%>%
+  select(-detection_rate)%>%
+  pivot_wider(names_from="class",values_from=c("n","num_confirmed"))%>%
+  mutate(TP=as.numeric(num_confirmed_DF),TN=as.numeric(n_F-num_confirmed_F),FP=as.numeric(num_confirmed_F),FN=as.numeric(n_DF-num_confirmed_DF),TS=n_F+n_DF)%>%
+  mutate(UA=TP/(FP+TP))%>%
+  mutate(PA=TP/(FN+TP))%>%
+  mutate(ACC=(TP+TN)/TS)%>%
+  mutate(TPR=TP/(TP+FN))%>%
+  mutate(PPV=TP/((TP+FP)))%>%
+  mutate(TNR=TN/(TN+FP))%>%
+  mutate(FPR=1-TNR,FNR=1-TPR)%>%
+  mutate(BACC=(1.3*TNR+.7*TPR)/2)%>%
+  mutate(F05= (1+beta^2)*PPV*TPR/(TPR+PPV*beta^2))%>%
+  mutate(MCC=(TP*TN-FP*FN)/(sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN))))%>%
+  mutate(FMI=sqrt((TP/(TP+FP))*(TP/(TP+FN))))
+```
+
+
+```{r fig.cap="Figure XX. User accuracy vs. Producer accuracy of the maximum likelihood detection procedure."}
+ggplot(final_results_ML%>%pivot_longer(c("UA","PA"),names_to="Accuracy",values_to="Percentage")%>%filter(treat%in%c("orig","origf","harmonf","spatialf")),aes(x=threshold,y=Percentage))+
+  geom_line(aes(color=treat,size=Accuracy))+
+  scale_size_manual(values=c(0.7,1.2))+
+  scale_linetype_manual(values=c(2,1))+
+  scale_color_manual(breaks=c("orig","origf","harmonf","spatialf"),labels=c("Original","Original Filtered","Harmonic","Spatial"),values=c("grey","orange","green","purple"))+
+  facet_grid(stab_pol~stab_period)+
+  coord_cartesian(xlim=c(-5,8))+
+  labs(x="Threshold",y="Accuracy",color="Treatment")+
+  theme_bw()
+
+
+```
+
+```{r accuracy_plots_ML,fig.cap="Figure XX. Global accuracy of the maximum likelihood detection procedure."}
+
+ggplot(final_results_ML%>%filter(treat%in%c("orig","origf","harmonf","spatialf")),aes(x=threshold,y=100*ACC))+
+  geom_line(aes(color=treat),size=1)+
+  scale_color_manual(name="Treatment",breaks=c("orig","origf","harmonf","spatialf"),labels=c("Original","Original Filtered","Harmonic","Spatial"),values=c("grey","orange","green","purple"))+
+  facet_grid(stab_pol~stab_period)+
+  coord_cartesian(xlim=c(-5,8))+
+  theme_bw()+labs(x="Threshold",y="Global accuracy (%)")
+``` 
+```{r ROC_plots_ML,fig.cap="Figure XX. ROC curves associated to the maximum likelihood detection procedure."}
+
+ggplot(final_results_ML%>%filter(treat%in%c("orig","origf","harmonf","spatialf")),aes(x=100*FPR,y=100*TPR))+
+  geom_line(aes(color=treat),size=1)+
+  scale_color_manual(name="Treatment",breaks=c("orig","origf","harmonf","spatialf"),labels=c("Original","Original Filtered","Harmonic","Spatial"),values=c("grey","orange","green","purple"))+
+  facet_grid(stab_pol~stab_period)+coord_cartesian(xlim=c(0,100),ylim=c(50,100))+
+  theme_bw()+labs(x="1-TNR (%)",y="TPR (%)")
+``` 
+```{r ROC_log_plots_ML,fig.cap="Figure XX. ROC curves associated to the maximum likelihood detection procedure."}
+
+ggplot(final_results_ML%>%filter(treat%in%c("orig","origf","harmonf","spatialf")),aes(x=100*FPR,y=100*TPR))+
+  geom_line(aes(color=treat),size=1)+
+  scale_color_manual(name="Treatment",breaks=c("orig","origf","harmonf","spatialf"),labels=c("Original","Original Filtered","Harmonic","Spatial"),values=c("grey","orange","green","purple"))+
+  facet_grid(stab_pol~stab_period)+
+  coord_cartesian(xlim=c(.1,100),ylim=c(30,100))+
+  scale_x_log10()+
+  scale_y_log10()+
+  theme_bw()+labs(x="False Positive Rate (%)",y="True Positive Rate (%)")
+``` 
+```{r ROC_ML_both,fig.width=8, fig.height=10}
+a <- ggplot(final_results_ML%>%filter(treat%in%c("orig","origf","harmonf","spatialf")),aes(x=100*FPR,y=100*TPR))+
+  geom_line(aes(color=treat),size=1)+
+  scale_color_manual(name="Treatment",breaks=c("orig","origf","harmonf","spatialf"),labels=c("Original","Original Filtered","Harmonic","Spatial"),values=c("grey","orange","green","purple"))+
+  facet_grid(stab_pol~stab_period)+coord_cartesian(xlim=c(0,100),ylim=c(50,100))+
+  theme_bw()+labs(x="False Positive Rate (%)",y="True Positive Rate (%)")
+b <- ggplot(final_results_ML%>%filter(treat%in%c("orig","origf","harmonf","spatialf")),aes(x=100*FPR,y=100*TPR))+
+  geom_line(aes(color=treat),size=1)+
+  geom_vline(xintercept=1,color='red')+
+  scale_color_manual(name="Treatment",breaks=c("orig","origf","harmonf","spatialf"),labels=c("Original","Original Filtered","Harmonic","Spatial"),values=c("grey","orange","green","purple"))+
+  facet_grid(stab_pol~stab_period)+
+  coord_cartesian(xlim=c(.1,100),ylim=c(30,100))+
+  scale_x_log10()+
+  scale_y_log10()+
+  theme_bw()+labs(x="1-TNR (%)",y="TPR (%)")
+
+ggpubr::ggarrange(a, b, labels = c("A", "B"), ncol = 1, nrow = 2,common.legend = T)
+```
+```{r table_results_ML}
+final_results_ML%>%
+  mutate(Accuracy=ACC*100,TNR=100*TNR,TPR=100*TPR)%>%
+  group_by(stab_period,stab_pol,treat)%>%
+  filter(Accuracy==max(Accuracy))%>%
+  select(stab_period,stab_pol,treat,threshold,n_DF,n_F,num_confirmed_DF,num_confirmed_F,Accuracy,TNR,TPR)%>%
+  arrange(desc(Accuracy))%>%
+  kable(caption="Table XX. Final results of the MLC detection.", digits=2)%>%kable_styling()
+ideal_TNR=99.5
+final_results_ML%>%
+  mutate(Accuracy=ACC*100,TNR=100*TNR,TPR=100*TPR)%>%
+  group_by(stab_period,stab_pol,treat)%>%
+  filter(abs(TNR-ideal_TNR)==min(abs(TNR-ideal_TNR)))%>%
+  filter(TPR==max(TPR))%>%
+  arrange(desc(TPR))%>%
+  select(stab_period,stab_pol,treat,threshold,n_DF,n_F,num_confirmed_DF,num_confirmed_F,Accuracy,TNR,TPR)%>%
+  arrange(desc(Accuracy))%>%
+  kable(caption="Table XX. Final results of the MLC detection.", digits=2)%>%kable_styling()
+```
+```{r table_results_ALT}
+final_results_ALT%>%
+  mutate(Accuracy=ACC*100,TNR=100*TNR,TPR=100*TPR)%>%
+  group_by(stab_period,stab_pol,treat)%>%
+  filter(Accuracy==max(Accuracy))%>%
+  select(stab_period,stab_pol,treat,threshold,n_DF,n_F,num_confirmed_DF,num_confirmed_F,Accuracy,TNR,TPR)%>%
+  arrange(desc(Accuracy))%>%
+  kable(caption="Table XX. Final results of the ALT detection.", digits=2)%>%kable_styling()
+ideal_TNR=99.5
+final_results_ALT%>%
+  mutate(Accuracy=ACC*100,TNR=100*TNR,TPR=100*TPR)%>%
+  group_by(stab_period,stab_pol,treat)%>%
+  filter(abs(TNR-ideal_TNR)==min(abs(TNR-ideal_TNR)))%>%
+  filter(TPR==max(TPR))%>%
+  arrange(desc(TPR))%>%
+  select(stab_period,stab_pol,treat,threshold,n_DF,n_F,num_confirmed_DF,num_confirmed_F,Accuracy,TNR,TPR)%>%
+  arrange(desc(Accuracy))%>%
+  kable(caption="Table XX. Final results of the ALT detection.", digits=2)%>%kable_styling()
+```
+
+
+```{r}
+ideal_TNR=98/100
+final_results_ML%>%group_by(treat,stab_period,stab_pol)%>%filter(abs(FPR-ideal_FPR)==min(abs(FPR-ideal_FPR)))%>%arrange(desc(TPR))%>%
+  select(stab_period,stab_pol,treat,threshold,n_DF,n_F,num_confirmed_DF,num_confirmed_F,Accuracy,TNR,TPR)%>%
+  arrange(desc(Accuracy))%>%
+  kable(caption="Table XX. Final results of the MLC detection.", digits=2)%>%kable_styling()
+
+final_results_ALT%>%group_by(treat,stab_period,stab_pol)%>%filter(abs(FPR-ideal_FPR)==min(abs(FPR-ideal_FPR)))%>%arrange(desc(TPR))%>%
+  select(stab_period,stab_pol,treat,threshold,n_DF,n_F,num_confirmed_DF,num_confirmed_F,Accuracy,TNR,TPR)%>%
+  arrange(desc(Accuracy))%>%
+  kable(caption="Table XX. Final results of the ALT detection.", digits=2)%>%kable_styling()
+```
+
